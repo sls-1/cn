@@ -10,6 +10,7 @@
 int main(void) {
     int s;
     struct sockaddr_in serv;
+    
     char buf[BUF];
 
     s = socket(AF_INET, SOCK_STREAM, 0);
