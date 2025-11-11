@@ -58,7 +58,6 @@ static ssize_t recv_all(int fd, void *buf, size_t len) {
     }
     return (ssize_t)total;
 }
-
 static void receive_file(int client_fd) {
     uint32_t name_len_net;
     uint32_t name_len;
@@ -85,28 +84,57 @@ static void receive_file(int client_fd) {
 
     filesize = ntoh64(filesize_net);
 
-    FILE *fp = fopen(file_name, "wb");
-    if (!fp) DieWithError("fopen");
+    /* build path: directory of the running binary + filename */
+    char *save_path = NULL;
+#if defined(PATH_MAX)
+    char exe_path[PATH_MAX];
+    ssize_t len = readlink("/proc/self/exe", exe_path, sizeof(exe_path) - 1);
+    if (len != -1) {
+        exe_path[len] = '\0';
+        char *dir_end = strrchr(exe_path, '/');
+        if (dir_end) *(dir_end + 1) = '\0'; /* keep trailing slash */
+        size_t need = strlen(exe_path) + strlen(file_name) + 1;
+        save_path = malloc(need + 1);
+        if (!save_path) DieWithError("malloc");
+        snprintf(save_path, need + 1, "%s%s", exe_path, file_name);
+    } else {
+        save_path = strdup(file_name);
+        if (!save_path) DieWithError("malloc");
+    }
+#else
+    save_path = strdup(file_name);
+    if (!save_path) DieWithError("malloc");
+#endif
+
+    FILE *fp = fopen(save_path, "wb");
+    if (!fp) {
+        free(save_path);
+        DieWithError("fopen");
+    }
 
     while (received < filesize) {
         size_t to_read = (size_t)((filesize - received) > BUFFER_SIZE ? BUFFER_SIZE : (filesize - received));
         ssize_t n = recv_all(client_fd, buffer, to_read);
         if (n <= 0) {
             fclose(fp);
+            free(save_path);
             DieWithError("recv file data");
         }
         size_t wrote = fwrite(buffer, 1, (size_t)n, fp);
         if (wrote != (size_t)n) {
             fclose(fp);
+            free(save_path);
             DieWithError("fwrite");
         }
         received += (uint64_t)n;
     }
 
     fclose(fp);
-    printf("Received file '%s' (%" PRIu64 " bytes)\n", file_name, filesize);
+    printf("Received file '%s' (%" PRIu64 " bytes)\n", save_path, filesize);
+    free(save_path);
     free(file_name);
 }
+
 
 int main(void) {
     struct sockaddr_in serveraddr, clientaddr;
