@@ -1,250 +1,216 @@
-// server.c
-#define _GNU_SOURCE
-#include <arpa/inet.h>
-#include <endian.h>
-#include <errno.h>
-#include <inttypes.h>
-#include <netinet/in.h>
-#include <signal.h>
-#include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <sys/socket.h>
-#include <unistd.h>
+/*
+ * server.c
+ * This program acts as a TCP server that can either:
+ * 1. Receive (upload) a large file from a client.
+ * 2. Send (download) a large file to a client.
+ *
+ * The client dictates the mode and filename over the socket.
+ */
 
-#define PORT 12345
-#define BUFFER_SIZE (1024 * 16)
-#define MAX_FILENAME_LEN 4096
+#include <stdio.h>      // For printf, fprintf, FILE, fopen, etc.
+#include <stdlib.h>     // For exit, atexit, EXIT_FAILURE
+#include <string.h>     // For memset
+#include <unistd.h>     // For close, read, write
+#include <arpa/inet.h>  // For INADDR_ANY, htons, etc.
+#include <sys/socket.h> // For socket, bind, listen, accept
+#include <netinet/in.h> // For struct sockaddr_in
 
-static int server_fd = -1;
+#define BUFFER_SIZE 4096      // Use a 4KB buffer
+#define FILENAME_MAX_LEN 256  // Max length for a filename
+#define MODE_LEN 10           // Max length for mode string ("upload")
 
-static void DieWithError(const char *msg) {
+/*
+ * Helper function to print an error message and exit.
+ */
+void die_with_error(const char *msg) {
     perror(msg);
     exit(EXIT_FAILURE);
 }
 
-static void handle_sigint(int signum) {
-    (void)signum;
-    if (server_fd >= 0) close(server_fd);
-    fprintf(stderr, "Server shutting down\n");
-    _exit(0);
-}
-
-/* Portable 64-bit network-to-host */
-static uint64_t ntoh64(uint64_t net) {
-#if defined(be64toh)
-    return be64toh(net);
-#elif defined(__APPLE__)
-    return OSSwapBigToHostInt64(net);
-#else
-    uint32_t hi = ntohl((uint32_t)(net >> 32));
-    uint32_t lo = ntohl((uint32_t)(net & 0xffffffffu));
-    return (((uint64_t)lo) << 32) | hi;
-#endif
-}
-
-static ssize_t recv_all(int fd, void *buf, size_t len) {
-    size_t total = 0;
-    char *p = buf;
-    while (total < len) {
-        ssize_t n = recv(fd, p + total, len - total, 0);
-        if (n == 0) return 0;
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            return -1;
-        }
-        total += (size_t)n;
+/*
+ * Handles receiving a file from the client (upload).
+ * The server reads from the client socket and writes to a file.
+ */
+void handle_upload(int client_sock, const char *filename) {
+    FILE *file = fopen(filename, "wb");
+    if (file == NULL) {
+        die_with_error("fopen() failed");
     }
-    return (ssize_t)total;
-}
-static void receive_file(int client_fd) {
-    uint32_t name_len_net;
-    uint32_t name_len;
-    char *file_name = NULL;
-    uint64_t filesize_net, filesize;
+
     char buffer[BUFFER_SIZE];
-    uint64_t received = 0;
+    ssize_t bytes_received;
+    long total_bytes = 0;
 
-    if (recv_all(client_fd, &name_len_net, sizeof(name_len_net)) <= 0)
-        DieWithError("recv filename length");
+    printf("Receiving file '%s'...\n", filename);
 
-    name_len = ntohl(name_len_net);
-    if (name_len == 0 || name_len > MAX_FILENAME_LEN)
-        DieWithError("invalid filename length");
-
-    file_name = malloc(name_len + 1);
-    if (!file_name) DieWithError("malloc");
-
-    if (recv_all(client_fd, file_name, name_len) <= 0) DieWithError("recv filename");
-    file_name[name_len] = '\0';
-
-    if (recv_all(client_fd, &filesize_net, sizeof(filesize_net)) <= 0)
-        DieWithError("recv filesize");
-
-    filesize = ntoh64(filesize_net);
-
-    /* build path: directory of the running binary + filename */
-    char *save_path = NULL;
-#if defined(PATH_MAX)
-    char exe_path[PATH_MAX];
-    ssize_t len = readlink("/proc/self/exe", exe_path, sizeof(exe_path) - 1);
-    if (len != -1) {
-        exe_path[len] = '\0';
-        char *dir_end = strrchr(exe_path, '/');
-        if (dir_end) *(dir_end + 1) = '\0'; /* keep trailing slash */
-        size_t need = strlen(exe_path) + strlen(file_name) + 1;
-        save_path = malloc(need + 1);
-        if (!save_path) DieWithError("malloc");
-        snprintf(save_path, need + 1, "%s%s", exe_path, file_name);
-    } else {
-        save_path = strdup(file_name);
-        if (!save_path) DieWithError("malloc");
-    }
-#else
-    save_path = strdup(file_name);
-    if (!save_path) DieWithError("malloc");
-#endif
-
-    FILE *fp = fopen(save_path, "wb");
-    if (!fp) {
-        free(save_path);
-        DieWithError("fopen");
-    }
-
-    while (received < filesize) {
-        size_t to_read = (size_t)((filesize - received) > BUFFER_SIZE ? BUFFER_SIZE : (filesize - received));
-        ssize_t n = recv_all(client_fd, buffer, to_read);
-        if (n <= 0) {
-            fclose(fp);
-            free(save_path);
-            DieWithError("recv file data");
+    // Loop until recv() returns 0 (connection closed) or -1 (error)
+    while ((bytes_received = recv(client_sock, buffer, BUFFER_SIZE, 0)) > 0) {
+        if (fwrite(buffer, 1, bytes_received, file) != bytes_received) {
+            die_with_error("fwrite() failed");
         }
-        size_t wrote = fwrite(buffer, 1, (size_t)n, fp);
-        if (wrote != (size_t)n) {
-            fclose(fp);
-            free(save_path);
-            DieWithError("fwrite");
-        }
-        received += (uint64_t)n;
+        total_bytes += bytes_received;
     }
 
-    fclose(fp);
-    printf("Received file '%s' (%" PRIu64 " bytes)\n", save_path, filesize);
-    free(save_path);
-    free(file_name);
+    if (bytes_received < 0) {
+        die_with_error("recv() failed");
+    }
+
+    fclose(file);
+    printf("File upload complete. Total bytes received: %ld\n", total_bytes);
 }
 
-
-int main(void) {
-    struct sockaddr_in serveraddr, clientaddr;
-    socklen_t clientaddr_len = sizeof(clientaddr);
-
-    signal(SIGINT, handle_sigint);
-
-    server_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (server_fd < 0) DieWithError("socket");
-
-    int opt = 1;
-    if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0)
-        DieWithError("setsockopt");
-
-    memset(&serveraddr, 0, sizeof(serveraddr));
-    serveraddr.sin_family = AF_INET;
-    serveraddr.sin_port = htons(PORT);
-    serveraddr.sin_addr.s_addr = htonl(INADDR_ANY);
-
-    if (bind(server_fd, (struct sockaddr *)&serveraddr, sizeof(serveraddr)) < 0)
-        DieWithError("bind");
-
-    if (listen(server_fd, 16) < 0) DieWithError("listen");
-
-    printf("Server listening on port %d\n", PORT);
-
-    for (;;) {
-        int client_fd = accept(server_fd, (struct sockaddr *)&clientaddr, &clientaddr_len);
-        if (client_fd < 0) {
-            if (errno == EINTR) continue;
-            DieWithError("accept");
-        }
-
-        char addrstr[INET_ADDRSTRLEN];
-        inet_ntop(AF_INET, &clientaddr.sin_addr, addrstr, sizeof(addrstr));
-        printf("Client connected: %s:%d\n", addrstr, ntohs(clientaddr.sin_port));
-
-        receive_file(client_fd);
-
-        close(client_fd);
-        printf("Client disconnected: %s\n", addrstr);
+/*
+ * Handles sending a file to the client (download).
+ * The server reads from a file and writes to the client socket.
+ */
+void handle_download(int client_sock, const char *filename) {
+    FILE *file = fopen(filename, "rb");
+    if (file == NULL) {
+        // Don't die, just tell the server console
+        fprintf(stderr, "fopen() failed for file: %s. File may not exist.\n", filename);
+        // We can't send the file, so just close the connection.
+        // The client's recv() will get 0 and know the transfer "finished" (with 0 bytes).
+        close(client_sock);
+        return;
     }
 
-    close(server_fd);
+    char buffer[BUFFER_SIZE];
+    size_t bytes_read;
+    long total_bytes = 0;
+
+    printf("Sending file '%s'...\n", filename);
+
+    // Read from file until end-of-file
+    while ((bytes_read = fread(buffer, 1, BUFFER_SIZE, file)) > 0) {
+        ssize_t total_sent = 0;
+
+        // Loop to ensure all bytes from the buffer are sent
+        while (total_sent < bytes_read) {
+            ssize_t bytes_sent = send(client_sock, buffer + total_sent, bytes_read - total_sent, 0);
+            if (bytes_sent < 0) {
+                // If send fails, the client probably disconnected
+                fprintf(stderr, "send() failed. Client may have disconnected.\n");
+                fclose(file);
+                close(client_sock); // Ensure socket is closed
+                return;
+            }
+            total_sent += bytes_sent;
+        }
+        total_bytes += total_sent;
+    }
+
+    fclose(file);
+    printf("File send complete. Total bytes sent: %ld\n", total_bytes);
+    
+    // We close the client socket to signal the end of transmission
+    // The client's recv() loop will then get a 0.
+    close(client_sock);
+}
+
+int main(int argc, char *argv[]) {
+    if (argc != 2) {
+        fprintf(stderr, "Usage: %s <port>\n", argv[0]);
+        fprintf(stderr, "  Example: %s 8080\n", argv[0]);
+        exit(EXIT_FAILURE);
+    }
+
+    int port = atoi(argv[1]);
+    if (port <= 0) {
+        fprintf(stderr, "Invalid port number.\n");
+        exit(EXIT_FAILURE);
+    }
+
+    int server_sock, client_sock;
+    struct sockaddr_in server_addr, client_addr;
+    socklen_t client_addr_len = sizeof(client_addr);
+
+    // 1. Create the server socket
+    server_sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (server_sock < 0) {
+        die_with_error("socket() failed");
+    }
+
+    // Set socket option to reuse address
+    int opt = 1;
+    if (setsockopt(server_sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
+        die_with_error("setsockopt() failed");
+    }
+
+    // 2. Prepare the server address structure
+    memset(&server_addr, 0, sizeof(server_addr));
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_addr.s_addr = INADDR_ANY; // Listen on all interfaces
+    server_addr.sin_port = htons(port);       // Network byte order
+
+    // 3. Bind the socket to the address and port
+    if (bind(server_sock, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
+        die_with_error("bind() failed");
+    }
+
+    // 4. Listen for incoming connections
+    if (listen(server_sock, 5) < 0) {
+        die_with_error("listen() failed");
+    }
+
+    printf("Server listening on port %d...\n", port);
+    
+    // 5. Accept client connections in a loop
+    for (;;) {
+        printf("Waiting for a client to connect...\n");
+        client_sock = accept(server_sock, (struct sockaddr *)&client_addr, &client_addr_len);
+        if (client_sock < 0) {
+            // Don't die, just log the error and wait for the next one
+            perror("accept() failed");
+            continue; 
+        }
+
+        char client_ip[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, sizeof(client_ip));
+        printf("Client connected from %s\n", client_ip);
+
+        // --- Protocol Start ---
+        char mode_buffer[MODE_LEN];
+        char filename_buffer[FILENAME_MAX_LEN];
+
+        // 6. Receive mode from client
+        ssize_t recv_len = recv(client_sock, mode_buffer, MODE_LEN, 0);
+        if (recv_len <= 0) {
+            fprintf(stderr, "Failed to receive mode from client\n");
+            close(client_sock);
+            continue; // Wait for next client
+        }
+        mode_buffer[MODE_LEN - 1] = '\0'; // Ensure null-termination
+
+        // 7. Receive filename from client
+        recv_len = recv(client_sock, filename_buffer, FILENAME_MAX_LEN, 0);
+        if (recv_len <= 0) {
+            fprintf(stderr, "Failed to receive filename from client\n");
+            close(client_sock);
+            continue; // Wait for next client
+        }
+        filename_buffer[FILENAME_MAX_LEN - 1] = '\0'; // Ensure null-termination
+
+        printf("Client requested mode: '%s', Filename: '%s'\n", mode_buffer, filename_buffer);
+
+        // 8. Handle the client request based on mode
+        if (strcmp(mode_buffer, "upload") == 0) {
+            handle_upload(client_sock, filename_buffer);
+        } else if (strcmp(mode_buffer, "download") == 0) {
+            handle_download(client_sock, filename_buffer);
+        } else {
+            fprintf(stderr, "Unknown mode from client: %s\n", mode_buffer);
+        }
+        // --- Protocol End ---
+
+        // 9. Close client socket (if not already closed by handler)
+        // handle_download() closes its own socket to signal EOF.
+        // handle_upload() relies on client's shutdown, so we close here.
+        if (strcmp(mode_buffer, "upload") == 0) {
+            close(client_sock);
+        }
+        printf("Client request finished. Waiting for new connection.\n");
+    }
+
+    close(server_sock); // Unreachable, but good practice
     return 0;
 }
-
-
-// #define _GNU_SOURCE
-// #include <arpa/inet.h>
-// #include <endian.h>
-// #include <netinet/in.h>
-// #include <stdint.h>
-// #include <stdio.h>
-// #include <stdlib.h>
-// #include <string.h>
-// #include <sys/socket.h>
-// #include <unistd.h>
-
-// #define PORT 12345
-// #define BUF  (1024*10)
-
-// static void die(const char *s){ perror(s); exit(1); }
-
-// static ssize_t recv_all(int fd, void *buf, size_t len){
-//     size_t t=0;
-//     while(t<len){
-//         ssize_t r = recv(fd, (char*)buf + t, len - t, 0);
-//         if(r<=0) return r;
-//         t += r;
-//     }
-//     return t;
-// }
-
-// int main(void){
-//     int srv = socket(AF_INET, SOCK_STREAM, 0); if(srv<0) die("socket");
-//     int opt = 1; setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-//     struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons(PORT), .sin_addr.s_addr = INADDR_ANY };
-//     if(bind(srv,(struct sockaddr*)&a,sizeof(a))<0) die("bind");
-//     if(listen(srv,10)<0) die("listen");
-//     printf("listening %d\n", PORT);
-
-//     int c = accept(srv, NULL, NULL); if(c<0) die("accept");
-
-//     uint32_t name_len_be; if(recv_all(c,&name_len_be,sizeof(name_len_be))<=0) die("recv");
-//     uint32_t name_len = ntohl(name_len_be);
-//     if(name_len==0 || name_len>4096) die("bad name len");
-
-//     char *name = malloc(name_len+1); if(!name) die("malloc");
-//     if(recv_all(c,name,name_len)<=0) die("recv name"); name[name_len]=0;
-
-//     uint64_t fs_be; if(recv_all(c,&fs_be,sizeof(fs_be))<=0) die("recv size");
-//     uint64_t filesize = be64toh(fs_be);
-
-//     FILE *f = fopen(name,"wb"); if(!f) die("fopen");
-//     free(name);
-
-//     char buf[BUF];
-//     uint64_t got = 0;
-//     while(got < filesize){
-//         size_t want = (filesize - got) > BUF ? BUF : (size_t)(filesize - got);
-//         ssize_t r = recv_all(c, buf, want);
-//         if(r<=0) die("recv data");
-//         fwrite(buf,1,r,f);
-//         got += r;
-//     }
-//     fclose(f);
-//     close(c);
-//     close(srv);
-//     printf("received %llu bytes\n", (unsigned long long)filesize);
-//     return 0;
-// }
-

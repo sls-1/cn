@@ -1,204 +1,162 @@
-// file_client.c
-#define _GNU_SOURCE
-#include <arpa/inet.h>
-#include <endian.h>
-#include <errno.h>
-#include <inttypes.h>
-#include <netinet/in.h>
-#include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <sys/socket.h>
-#include <unistd.h>
+#include <stdio.h>      
+#include <stdlib.h>     
+#include <string.h>     
+#include <unistd.h>     
+#include <arpa/inet.h>  
+#include <sys/socket.h> 
+#include <netinet/in.h> 
 
-#define BUFFER_SIZE (1024 * 16)
+#define BUFFER_SIZE 4096      
+#define FILENAME_MAX_LEN 256  
+#define MODE_LEN 10           
 
-static void DieWithError(const char *msg) {
+void die_with_error(const char *msg) {
     perror(msg);
     exit(EXIT_FAILURE);
 }
-
-static ssize_t send_all(int fd, const void *buf, size_t len) {
-    size_t total = 0;
-    const unsigned char *p = buf;
-    while (total < len) {
-        ssize_t n = send(fd, p + total, len - total, 0);
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            return -1;
-        }
-        if (n == 0) return 0;
-        total += (size_t)n;
-    }
-    return (ssize_t)total;
-}
-
-static off_t get_file_size(FILE *fp) {
-#if defined(_FILE_OFFSET_BITS) && _FILE_OFFSET_BITS == 64
-    if (fseeko(fp, 0, SEEK_END) != 0) return -1;
-    off_t s = ftello(fp);
-    rewind(fp);
-    return s;
-#else
-    /* fallback */
-    if (fseek(fp, 0, SEEK_END) != 0) return -1;
-    long s = ftell(fp);
-    rewind(fp);
-    return (off_t)s;
-#endif
-}
-
-static void send_file(int sockfd, const char *filename) {
-    FILE *fp = fopen(filename, "rb");
-    if (!fp) DieWithError("fopen");
-
-    off_t fsize = get_file_size(fp);
-    if (fsize < 0) {
-        fclose(fp);
-        DieWithError("determine file size");
-    }
-    uint64_t filesize = (uint64_t)fsize;
-
-    uint32_t name_len = (uint32_t)strlen(filename);
-    if (name_len == 0) {
-        fclose(fp);
-        DieWithError("empty filename");
-    }
-
-    uint32_t name_len_be = htonl(name_len);
-    if (send_all(sockfd, &name_len_be, sizeof(name_len_be)) != sizeof(name_len_be)) {
-        fclose(fp);
-        DieWithError("send filename length");
-    }
-
-    if (send_all(sockfd, filename, name_len) != (ssize_t)name_len) {
-        fclose(fp);
-        DieWithError("send filename");
-    }
-
-    uint64_t filesize_be = htobe64(filesize);
-    if (send_all(sockfd, &filesize_be, sizeof(filesize_be)) != sizeof(filesize_be)) {
-        fclose(fp);
-        DieWithError("send filesize");
+void handle_upload(int server_sock, const char *filename) {
+    FILE *file = fopen(filename, "rb");
+    if (file == NULL) {
+        die_with_error("fopen() failed. File may not exist.");
     }
 
     char buffer[BUFFER_SIZE];
-    size_t n;
-    uint64_t sent = 0;
-    while ((n = fread(buffer, 1, sizeof(buffer), fp)) > 0) {
-        if (send_all(sockfd, buffer, n) != (ssize_t)n) {
-            fclose(fp);
-            DieWithError("send file data");
+    size_t bytes_read;
+    long total_bytes = 0;
+
+    printf("Sending file '%s'...\n", filename);
+
+    
+    while ((bytes_read = fread(buffer, 1, BUFFER_SIZE, file)) > 0) {
+        ssize_t total_sent = 0;
+
+        while (total_sent < bytes_read) {
+            ssize_t bytes_sent = send(server_sock, buffer + total_sent, bytes_read - total_sent, 0);
+            if (bytes_sent < 0) {
+                die_with_error("send() failed");
+            }
+            total_sent += bytes_sent;
         }
-        sent += n;
+        total_bytes += total_sent;
     }
 
-    if (ferror(fp)) {
-        fclose(fp);
-        DieWithError("fread");
+    fclose(file);
+
+
+    if (shutdown(server_sock, SHUT_WR) < 0) {
+        die_with_error("shutdown() failed");
+    }
+    
+    printf("File send complete. Total bytes sent: %ld\n", total_bytes);
+}
+
+void handle_download(int server_sock, const char *filename) {
+    FILE *file = fopen(filename, "wb");
+    if (file == NULL) {
+        die_with_error("fopen() failed");
     }
 
-    fclose(fp);
-    printf("File '%s' sent: %" PRIu64 " bytes\n", filename, sent);
+    char buffer[BUFFER_SIZE];
+    ssize_t bytes_received;
+    long total_bytes = 0;
+
+    printf("Receiving file '%s'...\n", filename);
+
+    while ((bytes_received = recv(server_sock, buffer, BUFFER_SIZE, 0)) > 0) {
+        if (fwrite(buffer, 1, bytes_received, file) != bytes_received) {
+            die_with_error("fwrite() failed");
+        }
+        total_bytes += bytes_received;
+    }
+
+    if (bytes_received < 0) {
+        die_with_error("recv() failed");
+    }
+
+    fclose(file);
+    if (total_bytes == 0) {
+      
+        printf("File download complete, but 0 bytes received.\n");
+        printf("This may mean the file did not exist on the server.\n");
+    } else {
+        printf("File download complete. Total bytes received: %ld\n", total_bytes);
+    }
 }
 
 int main(int argc, char *argv[]) {
-    if (argc != 4) {
-        fprintf(stderr, "Usage: %s <server_ip> <port> <file>\n", argv[0]);
-        return EXIT_FAILURE;
+    if (argc != 5) {
+        fprintf(stderr, "Usage: %s <server_ip> <port> <mode> <filename>\n", argv[0]);
+        fprintf(stderr, "  Modes:\n");
+        fprintf(stderr, "    'upload'   - Sends <filename> to the server.\n");
+        fprintf(stderr, "    'download' - Requests <filename> from server, saves it as <filename>.\n");
+        fprintf(stderr, "  Example (upload):   %s 127.0.0.1 8080 upload my_video.mp4\n", argv[0]);
+        fprintf(stderr, "  Example (download): %s 127.0.0.1 8080 download server_file.dat\n", argv[0]);
+        exit(EXIT_FAILURE);
     }
 
     const char *server_ip = argv[1];
-    const char *port_str = argv[2];
-    const char *filename = argv[3];
+    int port = atoi(argv[2]);
+    const char *mode = argv[3];
+    const char *filename = argv[4];
 
-    int port = atoi(port_str);
-    if (port <= 0 || port > 65535) {
-        fprintf(stderr, "invalid port\n");
-        return EXIT_FAILURE;
+    if (strcmp(mode, "upload") != 0 && strcmp(mode, "download") != 0) {
+        fprintf(stderr, "Invalid mode. Use 'upload' or 'download'.\n");
+        exit(EXIT_FAILURE);
+    }
+    
+    if (port <= 0) {
+        fprintf(stderr, "Invalid port number.\n");
+        exit(EXIT_FAILURE);
+    }
+    
+    if (strlen(filename) >= FILENAME_MAX_LEN) {
+        fprintf(stderr, "Filename is too long (max %d chars).\n", FILENAME_MAX_LEN - 1);
+        exit(EXIT_FAILURE);
     }
 
-    int sockfd = socket(AF_INET, SOCK_STREAM, 0);
-    if (sockfd < 0) DieWithError("socket");
 
-    struct sockaddr_in serveraddr;
-    memset(&serveraddr, 0, sizeof(serveraddr));
-    serveraddr.sin_family = AF_INET;
-    serveraddr.sin_port = htons((uint16_t)port);
+    int server_sock;
+    struct sockaddr_in server_addr;
 
-    if (inet_pton(AF_INET, server_ip, &serveraddr.sin_addr) != 1) {
-        close(sockfd);
-        DieWithError("inet_pton");
+    server_sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (server_sock < 0) {
+        die_with_error("socket() failed");
     }
 
-    if (connect(sockfd, (struct sockaddr *)&serveraddr, sizeof(serveraddr)) < 0) {
-        close(sockfd);
-        DieWithError("connect");
+     memset(&server_addr, 0, sizeof(server_addr));
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(port); // Network byte order
+   if (inet_pton(AF_INET, server_ip, &server_addr.sin_addr) <= 0) {
+        die_with_error("inet_pton() failed for invalid address");
     }
 
-    send_file(sockfd, filename);
+    if (connect(server_sock, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
+        die_with_error("connect() failed");
+    }
 
-    close(sockfd);
-    return EXIT_SUCCESS;
+    printf("Connected to server %s:%d\n", server_ip, port);
+
+     char mode_buffer[MODE_LEN] = {0};
+    char filename_buffer[FILENAME_MAX_LEN] = {0};
+    
+     strncpy(mode_buffer, mode, MODE_LEN - 1);
+    if (send(server_sock, mode_buffer, MODE_LEN, 0) < 0) {
+        die_with_error("send(mode) failed");
+    }
+
+    strncpy(filename_buffer, filename, FILENAME_MAX_LEN - 1);
+    if (send(server_sock, filename_buffer, FILENAME_MAX_LEN, 0) < 0) {
+        die_with_error("send(filename) failed");
+    }
+
+
+     if (strcmp(mode, "upload") == 0) {
+        handle_upload(server_sock, filename);
+    } else { 
+         handle_download(server_sock, filename);
+    }
+
+     close(server_sock);
+
+    return 0;
 }
-
-
-
-// #define _GNU_SOURCE
-// #include <arpa/inet.h>
-// #include <endian.h>
-// #include <netinet/in.h>
-// #include <stdint.h>
-// #include <stdio.h>
-// #include <stdlib.h>
-// #include <string.h>
-// #include <sys/socket.h>
-// #include <unistd.h>
-
-// #define BUF  (1024*10)
-
-// static void die(const char *s){ perror(s); exit(1); }
-
-// static ssize_t send_all(int fd, const void *buf, size_t len){
-//     size_t t=0;
-//     while(t<len){
-//         ssize_t s = send(fd, (const char*)buf + t, len - t, 0);
-//         if(s<=0) return s;
-//         t += s;
-//     }
-//     return t;
-// }
-
-// int main(int argc, char **argv){
-//     if(argc!=4){ fprintf(stderr,"Usage: %s <host> <port> <file>\n",argv[0]); return 1; }
-
-//     const char *host = argv[1]; int port = atoi(argv[2]); const char *file = argv[3];
-
-//     FILE *f = fopen(file,"rb"); if(!f) die("fopen");
-//     fseek(f,0,SEEK_END); uint64_t filesize = ftell(f); rewind(f);
-
-//     int sfd = socket(AF_INET, SOCK_STREAM, 0); if(sfd<0) die("socket");
-//     struct sockaddr_in a; memset(&a,0,sizeof(a));
-//     a.sin_family = AF_INET; a.sin_port = htons(port);
-//     if(inet_pton(AF_INET, host, &a.sin_addr) <= 0) die("inet_pton");
-//     if(connect(sfd,(struct sockaddr*)&a,sizeof(a))<0) die("connect");
-
-//     uint32_t name_len = strlen(file);
-//     uint32_t name_len_be = htonl(name_len);
-//     if(send_all(sfd,&name_len_be,sizeof(name_len_be))!=sizeof(name_len_be)) die("send");
-//     if(send_all(sfd,file,name_len)!=(ssize_t)name_len) die("send name");
-
-//     uint64_t fs_be = htobe64(filesize);
-//     if(send_all(sfd,&fs_be,sizeof(fs_be))!=sizeof(fs_be)) die("send size");
-
-//     char buf[BUF]; size_t n;
-//     while((n=fread(buf,1,sizeof(buf),f))>0){
-//         if(send_all(sfd,buf,n)!=(ssize_t)n) die("send data");
-//     }
-
-//     fclose(f);
-//     close(sfd);
-//     printf("sent %llu bytes\n",(unsigned long long)filesize);
-//     return 0;
-// }
