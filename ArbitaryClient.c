@@ -45,7 +45,7 @@ int main(void) {
     serv.sin_family = AF_INET;
     serv.sin_port = htons(PORT);
 
-    if (inet_pton(AF_INET, "127.0.0.1", &serv.sin_addr) <= 0) { perror("inet_pton"); close(sockfd); exit(1); }
+    if (inet_pton(AF_INET, "10.0.10.10", &serv.sin_addr) <= 0) { perror("inet_pton"); close(sockfd); exit(1); }
 
     if (connect(sockfd, (struct sockaddr*)&serv, sizeof(serv)) < 0) { perror("connect"); close(sockfd); exit(1); }
     puts("Connected to server");
